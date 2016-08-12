@@ -17,6 +17,7 @@ const HUNK_RELOC32: u32 = 1004;
 const HUNK_DEBUG: u32 = 1009;
 const HUNK_SYMBOL: u32 = 1008;
 const HUNK_END: u32 = 1010;
+const DEBUG_LINE: u32 = 0x4c494e45;
 
 const HUNKF_CHIP: u32 = 1 << 30;
 const HUNKF_FAST: u32 = 1 << 31;
@@ -47,6 +48,24 @@ impl fmt::Debug for Symbol {
     }
 }
 
+pub struct SourceLine {
+    line: u32,
+    offset: u32,
+}
+
+impl fmt::Debug for SourceLine {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "0x{:08x} - {}\n", self.offset, self.line)
+    }
+}
+
+#[derive(Debug)]
+pub struct SourceFile {
+    name: String,
+    base_offset: u32,
+    lines: Vec<SourceLine>,
+}
+
 #[derive(Debug)]
 pub struct Hunk {
     pub mem_type: MemoryType,
@@ -56,6 +75,7 @@ pub struct Hunk {
     pub code_data: Option<Vec<u8>>, 
     pub reloc_32: Option<Vec<RelocInfo32>>,
     pub symbols: Option<Vec<Symbol>>,
+    pub line_debug_info: Option<Vec<SourceFile>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +89,6 @@ struct SizesTypes {
     mem_type: MemoryType,
     size: usize,
 }
-
 
 impl HunkParser {
     fn skip_hunk(file: &mut File, name: &'static str) -> io::Result<()> {
@@ -164,12 +183,50 @@ impl HunkParser {
         Ok(())
     }
 
-    fn parse_debug(_hunk: &mut Hunk, file: &mut File) -> io::Result<()> {
+    fn fill_debug_info(base_offset: u32, num_longs: u32, file: &mut File) -> io::Result<SourceFile> {
+        let num_name_longs = try!(file.read_u32::<BigEndian>());
+        let name = try!(Self::read_name_size(file, num_name_longs));
+        let num_lines = (num_longs - num_name_longs - 1) / 2;
+        let mut lines = Vec::with_capacity(num_lines as usize);
+
+        for _ in 0..num_lines {
+            let line_no = try!(file.read_u32::<BigEndian>()) & 0xffffff; // mask for SAS/C extra info
+            let offset = try!(file.read_u32::<BigEndian>());
+            lines.push(SourceLine {
+                line: line_no,
+                offset: base_offset + offset,
+            });
+        }
+
+        Ok(SourceFile {
+            name: name,
+            base_offset: base_offset,
+            lines: lines,
+        })
+    }
+
+    fn parse_debug(hunk: &mut Hunk, file: &mut File) -> io::Result<()> {
         let num_longs = try!(file.read_u32::<BigEndian>()) - 2; // skip base offset and tag
-        let _base_offset = try!(file.read_u32::<BigEndian>());
-        let _debug_tag = try!(file.read_u32::<BigEndian>());
-        // skip for now
-        file.seek(io::SeekFrom::Current((num_longs * 4) as i64)).map(|_|())
+        let base_offset = try!(file.read_u32::<BigEndian>());
+        let debug_tag = try!(file.read_u32::<BigEndian>());
+
+        // We only support debug line as debug format currently so skip if not found
+        if debug_tag != DEBUG_LINE {
+            try!(file.seek(io::SeekFrom::Current((num_longs * 4) as i64)).map(|_|()));
+            return Ok(());
+        }
+
+        if let Some(ref mut debug_info) = hunk.line_debug_info {
+            let source_file = try!(Self::fill_debug_info(base_offset, num_longs, file));
+            debug_info.push(source_file);
+        } else {
+            let mut debug_info = Vec::new();
+            let source_file = try!(Self::fill_debug_info(base_offset, num_longs, file));
+            debug_info.push(source_file);
+            hunk.line_debug_info = Some(debug_info);
+        }
+
+        return Ok(());
     }
 
     fn parse_reloc32(hunk: &mut Hunk, file: &mut File) -> io::Result<()> {
@@ -270,6 +327,7 @@ impl HunkParser {
                     code_data: None, 
                     reloc_32: None, 
                     symbols: None, 
+                    line_debug_info: None,
             };
 
             try!(Self::fill_hunk(&mut hunk, &mut file));
